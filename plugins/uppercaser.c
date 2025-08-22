@@ -8,8 +8,6 @@
 const char* plugin_transform(const char* input) {
 
     if (!input) return NULL;
-    printf("[DEBUG][uppercaser] input: %s\n", input);  
-
 
     if (strcmp(input, "<END>") == 0){
         return strdup("<END>");
@@ -24,8 +22,6 @@ const char* plugin_transform(const char* input) {
         result[i] = toupper(result[i]);
     }
     
-    printf("[PLUGIN][uppercaser] transformed: %s\n", result);
-
     return result;
 }
 

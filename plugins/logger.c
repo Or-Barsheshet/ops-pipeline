@@ -5,9 +5,11 @@
 
 const char* logger_transform(const char* input) {
     if (!input) return NULL;
-    
-    printf("[DEBUG][logger] input: %s\n", input);  
 
+    if (strcmp(input, "<END>") == 0) {
+        return strdup("<END>"); 
+    }
+    
     printf("[logger] %s\n", input);
     return strdup(input);  // return a duplicate even if logger doesn't change it
 }

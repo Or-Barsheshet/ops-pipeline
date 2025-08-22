@@ -49,11 +49,9 @@ void monitor_reset(monitor_t* monitor) {
 int monitor_wait(monitor_t* monitor) {
     if (!monitor) return -1;
 
-    pthread_mutex_lock(&monitor->mutex);
     while (!monitor->signaled) {
         pthread_cond_wait(&monitor->condition, &monitor->mutex);
     }
-    pthread_mutex_unlock(&monitor->mutex);
-
+    monitor->signaled = 0;
     return 0;
 }
