@@ -1,57 +1,88 @@
 #include "monitor.h"
+#include <errno.h>   // ETIMEDOUT
 
-// initialize the monitor: set mutex, condition, and reset signaled flag
-int monitor_init(monitor_t* monitor) {
-    if (!monitor) return -1;
+/* מחשב זמן absolute לעוד ms מילישניות.
+   משתמש ב‑C11 timespec_get במקום clock_gettime. */
+static void timespec_after_ms(struct timespec* ts, int ms) {
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);               // C11, ללא תלות ב‑POSIX
+    ts->tv_sec  = now.tv_sec + (ms / 1000);
+    long nsec   = now.tv_nsec + (long)(ms % 1000) * 1000000L;
+    ts->tv_sec += nsec / 1000000000L;
+    ts->tv_nsec = nsec % 1000000000L;
+}
 
-    // initialize mutex
-    if (pthread_mutex_init(&monitor->mutex, NULL) != 0) return -1;
-
-    // initialize condition variable
-    if (pthread_cond_init(&monitor->condition, NULL) != 0) {
-        pthread_mutex_destroy(&monitor->mutex);
+int monitor_init(monitor_t* m) {
+    if (!m) return -1;
+    if (pthread_mutex_init(&m->mutex, NULL) != 0) return -1;
+    if (pthread_cond_init(&m->condition, NULL) != 0) {
+        pthread_mutex_destroy(&m->mutex);
         return -1;
     }
-
-    // reset signaled flag
-    monitor->signaled = 0;
+    m->signaled = 0;
     return 0;
 }
 
-// destroy the monitor: release mutex and condition resources
-void monitor_destroy(monitor_t* monitor) {
-    if (!monitor) return;
-
-    pthread_mutex_destroy(&monitor->mutex);
-    pthread_cond_destroy(&monitor->condition);
+void monitor_destroy(monitor_t* m) {
+    if (!m) return;
+    pthread_mutex_destroy(&m->mutex);
+    pthread_cond_destroy(&m->condition);
 }
 
-// signal the monitor: set flag and wake one waiting thread
-void monitor_signal(monitor_t* monitor) {
-    if (!monitor) return;
-
-    pthread_mutex_lock(&monitor->mutex);
-    monitor->signaled = 1;
-    pthread_cond_signal(&monitor->condition); // wake one
-    pthread_mutex_unlock(&monitor->mutex);
+void monitor_signal(monitor_t* m) {
+    if (!m) return;
+    pthread_mutex_lock(&m->mutex);
+    m->signaled = 1;
+    pthread_cond_signal(&m->condition);   // מעיר ממתין אחד (מספיק כאן)
+    pthread_mutex_unlock(&m->mutex);
 }
 
-// reset the monitor's signaled flag to 0
-void monitor_reset(monitor_t* monitor) {
-    if (!monitor) return;
-
-    pthread_mutex_lock(&monitor->mutex);
-    monitor->signaled = 0;
-    pthread_mutex_unlock(&monitor->mutex);
+void monitor_reset(monitor_t* m) {
+    if (!m) return;
+    pthread_mutex_lock(&m->mutex);
+    m->signaled = 0;
+    pthread_mutex_unlock(&m->mutex);
 }
 
-// wait until monitor is signaled (blocking)
-int monitor_wait(monitor_t* monitor) {
-    if (!monitor) return -1;
-
-    while (!monitor->signaled) {
-        pthread_cond_wait(&monitor->condition, &monitor->mutex);
+int monitor_wait(monitor_t* m) {
+    if (!m) return -1;
+    pthread_mutex_lock(&m->mutex);
+    while (!m->signaled) {
+        pthread_cond_wait(&m->condition, &m->mutex);
     }
-    monitor->signaled = 0;
+    m->signaled = 0;                       // צרכנו את האות
+    pthread_mutex_unlock(&m->mutex);
+    return 0;
+}
+
+/* מניח: המנעול כבר נעול ע"י הקורא */
+int monitor_wait_locked(monitor_t* m) {
+    if (!m) return -1;
+    while (!m->signaled) {
+        pthread_cond_wait(&m->condition, &m->mutex);
+    }
+    m->signaled = 0;
+    return 0;
+}
+
+/* מניח: המנעול כבר נעול ע"י הקורא; ממתין עד timeout */
+int monitor_timedwait_locked(monitor_t* m, int milliseconds) {
+    if (!m) return -1;
+
+    if (m->signaled) {          // אות "דביק" שכבר הגיע קודם
+        m->signaled = 0;
+        return 0;
+    }
+
+    struct timespec ts;
+    timespec_after_ms(&ts, milliseconds);
+
+    int rc;
+    while (!m->signaled) {
+        rc = pthread_cond_timedwait(&m->condition, &m->mutex, &ts);
+        if (rc == ETIMEDOUT) return 1;     // לא הגיע אות עד הדדליין
+        if (rc != 0)        return -1;     // שגיאה אחרת
+    }
+    m->signaled = 0;
     return 0;
 }
