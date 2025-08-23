@@ -4,29 +4,18 @@
 #include <pthread.h>
 #include <time.h>
 
-/* Monitor עם מצב "דביק" (flag signaled) */
+/* Monitor structure (sticky flag for lost signals protection) */
 typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t  condition;
-    int             signaled;
+    pthread_cond_t condition;
+    int            signaled;
 } monitor_t;
 
-/* אתחול/השמדה */
-int  monitor_init(monitor_t* monitor);
-void monitor_destroy(monitor_t* monitor);
+int  monitor_init(monitor_t* m);
+void monitor_destroy(monitor_t* m);
 
-/* אות וסיפוס (איפוס) */
-void monitor_signal(monitor_t* monitor);
-void monitor_reset(monitor_t* monitor);
+void monitor_signal_locked(monitor_t* m, pthread_mutex_t* external_mutex);
+void monitor_reset_locked(monitor_t* m, pthread_mutex_t* external_mutex);
 
-/* API 1: wait שמנהל את הנעילה בפנים */
-int  monitor_wait(monitor_t* monitor);
-
-/* API 2: wait שמניח שה‑mutex כבר נעול ע"י הקורא */
-int  monitor_wait_locked(monitor_t* monitor);
-
-/* API 3: כמו API 2, אבל עם timeout במילישניות.
-   מחזיר 0 אם התקבל אות, 1 אם timeout, ‎-1 אם שגיאה. */
-int  monitor_timedwait_locked(monitor_t* monitor, int milliseconds);
+int  monitor_wait_locked(monitor_t* m, pthread_mutex_t* external_mutex);
 
 #endif /* MONITOR_H */

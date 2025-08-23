@@ -8,13 +8,44 @@
 #include <unistd.h>
 #include "plugins/plugin_sdk.h"
 
-// Define function pointer types for clarity
+// Function pointer typedefs
 typedef const char* (*plugin_init_func_t)(int);
 typedef const char* (*plugin_fini_func_t)(void);
 typedef const char* (*plugin_place_work_func_t)(const char*);
-typedef void (*plugin_attach_func_t)(const char* (*)(const char*));
+typedef void        (*plugin_attach_func_t)(const char* (*)(const char*));
 typedef const char* (*plugin_wait_finished_func_t)(void);
 typedef const char* (*plugin_get_name_func_t)(void);
+
+// Plugin handle
+typedef struct {
+    void* handle;
+    const char* name_for_logs;               // for messages before plugin_init returns a name
+    plugin_get_name_func_t      get_name;
+    plugin_init_func_t          init;
+    plugin_fini_func_t          fini;
+    plugin_place_work_func_t    place_work;
+    plugin_attach_func_t        attach;
+    plugin_wait_finished_func_t wait_finished;
+} plugin_handle_t;
+
+// Input reader thread args
+typedef struct {
+    plugin_place_work_func_t first_plugin_place_work;
+} input_thread_args_t;
+
+static void print_usage(void) {
+    printf("Usage: ./analyzer <queue_size> <plugin1> <plugin2> ... <pluginN>\n");
+    printf("Arguments:\n");
+    printf("  queue_size    Positive integer for each plugin's queue capacity\n");
+    printf("  plugin1..N    Names of plugins to load (without .so extension)\n");
+    printf("\n");
+    printf("Common plugins (if present):\n");
+    printf("  logger, typewriter, uppercaser, rotator, flipper, expander\n");
+    printf("\nExamples:\n");
+    printf("  ./analyzer 20 uppercaser rotator logger\n");
+    printf("  echo 'hello' | ./analyzer 20 uppercaser rotator logger\n");
+    printf("  echo '<END>' | ./analyzer 20 uppercaser rotator logger\n");
+}
 
 #define LOAD_SYM(P,I,FIELD,SYMSTR) do {                           \
     dlerror();                                                     \
@@ -31,52 +62,27 @@ typedef const char* (*plugin_get_name_func_t)(void);
     }                                                              \
 } while (0)
 
-// A struct to hold all the function pointers and data for a loaded plugin
-typedef struct {
-    void* handle;
-    const char* name;
-    plugin_get_name_func_t get_name;
-    plugin_init_func_t init;
-    plugin_fini_func_t fini;
-    plugin_place_work_func_t place_work;
-    plugin_attach_func_t attach;
-    plugin_wait_finished_func_t wait_finished;
-    char temp_path[256];
-} plugin_handle_t;
-
-// Struct to pass arguments to the input reader thread
-typedef struct {
-    plugin_place_work_func_t first_plugin_place_work;
-} input_thread_args_t;
-
-static void print_usage(void) {
-    printf("Usage: ./analyzer <queue_size> <plugin1> <plugin2> ... <pluginN>\n");
-    printf("Arguments:\n");
-    printf("  queue_size    Maximum number of items in each plugin's queue\n");
-    printf("  plugin1..N    Names of plugins to load (without .so extension)\n");
-    printf("Available plugins:\n");
-    printf("  logger     - Logs all strings that pass through\n");
-    printf("  typewriter - Simulates typewriter effect with delays\n");
-    printf("  uppercaser - Converts strings to uppercase\n");
-    printf("  rotator    - Moves every character to the right. Last character moves to the beginning.\n");
-    printf("  flipper    - Reverses the order of characters\n");
-    printf("  expander   - Expands each character with spaces\n");
-    printf("Example:\n");
-    printf("  ./analyzer 20 uppercaser rotator logger\n");
-    printf("\n");
-    printf("  echo 'hello' | ./analyzer 20 uppercaser rotator logger\n");
-    printf("  echo '<END>' | ./analyzer 20 uppercaser rotator logger\n");
+// Reject duplicate plugin names (we do NOT support multiple instances)
+static int has_duplicate_names(char** names, int n, const char** dup_out) {
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            if (strcmp(names[i], names[j]) == 0) {
+                if (dup_out) *dup_out = names[i];
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
-// This function runs in a dedicated thread to read from stdin
-void* input_reader_thread(void* arg) {
+// Input reader thread — forwards lines to first plugin
+static void* input_reader_thread(void* arg) {
     input_thread_args_t* args = (input_thread_args_t*)arg;
     char buffer[1025];
     int saw_end = 0;
 
     while (fgets(buffer, sizeof(buffer), stdin)) {
-        buffer[strcspn(buffer, "\n")] = 0;
-
+        buffer[strcspn(buffer, "\n")] = 0; // strip trailing \n
         const char* err = args->first_plugin_place_work(buffer);
         if (err) fprintf(stderr, "[ERROR][input] %s\n", err);
         if (strcmp(buffer, "<END>") == 0) {
@@ -91,31 +97,9 @@ void* input_reader_thread(void* arg) {
     free(args);
     return NULL;
 }
-static int count_previous(const char* name, char** names, int upto) {
-    int c = 0;
-    for (int k = 0; k < upto; ++k)
-        if (strcmp(names[k], name) == 0) c++;
-    return c;
-}
-
-static int copy_file(const char* src, const char* dst) {
-    FILE *in = fopen(src, "rb");
-    if (!in) return -1;
-    FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return -1; }
-    char buf[1<<16];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); return -1; }
-    }
-    fclose(in);
-    fclose(out);
-    return 0;
-}
-
 
 int main(int argc, char* argv[]) {
-    // 1. Argument Parsing
+    // ---- 1) Parse args ----
     if (argc < 3) {
         fprintf(stderr, "Error: Not enough arguments.\n");
         print_usage();
@@ -130,69 +114,57 @@ int main(int argc, char* argv[]) {
     int num_plugins = argc - 2;
     char** plugin_names = &argv[2];
 
-    plugin_handle_t* plugins = calloc(num_plugins, sizeof(plugin_handle_t));
+    const char* dup_name = NULL;
+    if (has_duplicate_names(plugin_names, num_plugins, &dup_name)) {
+        fprintf(stderr, "Error: Multiple instances of plugin '%s' are not supported in this implementation.\n", dup_name);
+        fprintf(stderr, "Hint: The assignment allows single instance per plugin; multi-instance is a bonus.\n");
+        return 1;
+    }
+
+    plugin_handle_t* plugins = (plugin_handle_t*)calloc(num_plugins, sizeof(plugin_handle_t));
     if (!plugins) {
         perror("Failed to allocate memory for plugins");
         return 1;
     }
 
-    // 2. Load Plugin Shared Objects
-   // 2. Load Plugin Shared Objects
-for (int i = 0; i < num_plugins; i++) {
-    char plugin_path[256];
-    snprintf(plugin_path, sizeof(plugin_path), "./output/%s.so", plugin_names[i]);
+    // ---- 2) dlopen + dlsym for each plugin (arbitrary name allowed if file exists) ----
+    for (int i = 0; i < num_plugins; ++i) {
+        char so_path[256];
+        snprintf(so_path, sizeof(so_path), "./output/%s.so", plugin_names[i]);
 
-    // בדיקה: האם זה מופע שני/שלישי של אותו פלאגין?
-    int inst = count_previous(plugin_names[i], plugin_names, i);
-    const char* path_to_load = plugin_path;
-    plugins[i].temp_path[0] = '\0';
-
-    if (inst > 0) {
-        // יוצרים עותק ייחודי כדי לקבל BSS/סטטיקים נפרדים לכל מופע
-        snprintf(plugins[i].temp_path, sizeof(plugins[i].temp_path),
-                 "./output/%s__inst%d.so", plugin_names[i], inst);
-        if (copy_file(plugin_path, plugins[i].temp_path) != 0) {
-            fprintf(stderr, "Error: failed to create copy for %s (instance %d)\n",
-                    plugin_names[i], inst);
+        plugins[i].handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+        if (!plugins[i].handle) {
+            fprintf(stderr, "Error loading plugin '%s' from %s: %s\n",
+                    plugin_names[i], so_path, dlerror());
             print_usage();
-            for (int j = 0; j < i; ++j) if (plugins[j].handle) dlclose(plugins[j].handle);
+            // cleanup previous
+            for (int j = 0; j < i; ++j) {
+                if (plugins[j].handle) dlclose(plugins[j].handle);
+            }
             free(plugins);
             return 1;
         }
-        path_to_load = plugins[i].temp_path;
+
+        LOAD_SYM(plugins, i, get_name,      "plugin_get_name");
+        LOAD_SYM(plugins, i, init,          "plugin_init");
+        LOAD_SYM(plugins, i, fini,          "plugin_fini");
+        LOAD_SYM(plugins, i, place_work,    "plugin_place_work");
+        LOAD_SYM(plugins, i, attach,        "plugin_attach");
+        LOAD_SYM(plugins, i, wait_finished, "plugin_wait_finished");
+
+        // name for logs before init (get_name may rely on init in some impls)
+        plugins[i].name_for_logs = plugin_names[i];
     }
 
-    // נשארים עם dlopen בלבד, כדרישת המטלה
-    plugins[i].handle = dlopen(path_to_load, RTLD_NOW | RTLD_LOCAL);
-    if (!plugins[i].handle) {
-        fprintf(stderr, "Error loading plugin %s: %s\n", plugin_names[i], dlerror());
-        print_usage();
-        for (int j = 0; j < i; j++) if (plugins[j].handle) dlclose(plugins[j].handle);
-        // ניקוי קבצים זמניים שנוצרו עד כה
-        for (int j = 0; j < i; ++j) if (plugins[j].temp_path[0]) unlink(plugins[j].temp_path);
-        free(plugins);
-        return 1;
-    }
-
-    LOAD_SYM(plugins, i, get_name,      "plugin_get_name");
-    LOAD_SYM(plugins, i, init,          "plugin_init");
-    LOAD_SYM(plugins, i, fini,          "plugin_fini");
-    LOAD_SYM(plugins, i, place_work,    "plugin_place_work");
-    LOAD_SYM(plugins, i, attach,        "plugin_attach");
-    LOAD_SYM(plugins, i, wait_finished, "plugin_wait_finished");
-
-    // שם ללוגים לפני init (plugin_get_name יחזיר ערך רק אחרי init אצלך)
-    plugins[i].name = plugin_names[i];
-        
-    }
-
-    // 3. Initialize Plugins
-    for (int i = 0; i < num_plugins; i++) {
+    // ---- 3) init all plugins ----
+    for (int i = 0; i < num_plugins; ++i) {
         const char* err = plugins[i].init(queue_size);
         if (err) {
-            fprintf(stderr, "Error initializing plugin %s: %s\n", plugins[i].name, err);
-            for (int j = i-1; j >= 0; --j){
-                if(plugins[j].fini) plugins[j].fini();
+            fprintf(stderr, "Error initializing plugin %s: %s\n",
+                    plugins[i].name_for_logs, err);
+            // best-effort cleanup
+            for (int j = i - 1; j >= 0; --j) {
+                if (plugins[j].fini) plugins[j].fini();
                 if (plugins[j].handle) dlclose(plugins[j].handle);
             }
             free(plugins);
@@ -200,48 +172,60 @@ for (int i = 0; i < num_plugins; i++) {
         }
     }
 
-    // 4. Attach Plugins Together
-    for (int i = 0; i < num_plugins - 1; i++) {
+    // ---- 4) attach chain (linear) ----
+    for (int i = 0; i < num_plugins - 1; ++i) {
         plugins[i].attach(plugins[i + 1].place_work);
     }
 
-    // 5. Start a dedicated thread for reading input to prevent main from blocking
+    // ---- 5) input thread (so main can wait on plugins) ----
     pthread_t input_tid;
-    input_thread_args_t* thread_args = malloc(sizeof(input_thread_args_t));
-    if(!thread_args){
-        perror("Failed to allocate memory for input thread arguments");
-        for (int i = 0; i < num_plugins; i++) dlclose(plugins[i].handle);
+    input_thread_args_t* args = (input_thread_args_t*)malloc(sizeof(input_thread_args_t));
+    if (!args) {
+        perror("Failed to allocate memory for input thread args");
+        for (int i = num_plugins - 1; i >= 0; --i) {
+            if (plugins[i].fini) plugins[i].fini();
+            if (plugins[i].handle) dlclose(plugins[i].handle);
+        }
         free(plugins);
         return 1;
     }
-    thread_args->first_plugin_place_work = plugins[0].place_work;
-    if (pthread_create(&input_tid, NULL, input_reader_thread, thread_args) != 0) {
+    args->first_plugin_place_work = plugins[0].place_work;
+
+    if (pthread_create(&input_tid, NULL, input_reader_thread, args) != 0) {
         perror("Failed to create input reader thread");
-        for (int i = 0; i < num_plugins; i++) dlclose(plugins[i].handle);
+        free(args);
+        for (int i = num_plugins - 1; i >= 0; --i) {
+            if (plugins[i].fini) plugins[i].fini();
+            if (plugins[i].handle) dlclose(plugins[i].handle);
+        }
         free(plugins);
         return 1;
     }
 
-    // 6. Wait for Plugins to Finish 
-    for (int i = 0; i < num_plugins; i++) {
-       const char* err = plugins[i].wait_finished();
-       if(err){
-        fprintf(stderr, "Error waiting for plugin %s: %s\n", plugins[i].name, err);
-       }
+    // ---- 6) wait_finished in ascending order ----
+    for (int i = 0; i < num_plugins; ++i) {
+        const char* err = plugins[i].wait_finished();
+        if (err) {
+            fprintf(stderr, "Error waiting for plugin %s: %s\n",
+                    plugins[i].name_for_logs, err);
+        }
     }
-    
-    // Wait for the input thread to finish its work as well
+
+    // also wait for input thread
     pthread_join(input_tid, NULL);
 
-    // 7. Cleanup
-    for (int i = num_plugins - 1; i >= 0; i--) {
-        plugins[i].fini();
-        dlclose(plugins[i].handle);
-        if (plugins[i].temp_path[0]) {
-            unlink(plugins[i].temp_path);  // מחיקת העותק הזמני
-        }   
+    // ---- 7) fini + dlclose in reverse order ----
+    for (int i = num_plugins - 1; i >= 0; --i) {
+        if (plugins[i].fini) {
+            const char* err = plugins[i].fini();
+            if (err) {
+                fprintf(stderr, "Error finalizing plugin %s: %s\n",
+                        plugins[i].name_for_logs, err);
+            }
+        }
+        if (plugins[i].handle) dlclose(plugins[i].handle);
     }
-    
+
     free(plugins);
     printf("Pipeline shutdown complete\n");
     return 0;
