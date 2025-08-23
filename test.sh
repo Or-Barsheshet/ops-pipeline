@@ -32,7 +32,7 @@ print_status "Test 2 PASSED"
 
 # Test 3: Deadlock/Traffic Jam test
 print_status "Running Test 3: Deadlock/Traffic Jam"
-EXPECTED="[logger]  B AC"
+EXPECTED="[logger] B AC "
 ACTUAL=$(echo -e "abc\n<END>" | $ANALYZER 50 uppercaser expander rotator rotator flipper logger typewriter | grep "\[logger\]" || true)
 [ "$ACTUAL" == "$EXPECTED" ] || print_error "Test 3 FAILED (Expected '$EXPECTED', got '$ACTUAL')"
 print_status "Test 3 PASSED"

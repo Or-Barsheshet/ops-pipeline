@@ -11,6 +11,7 @@ const char* logger_transform(const char* input) {
     }
     
     printf("[logger] %s\n", input);
+    fflush(stdout);
     return strdup(input);  // return a duplicate even if logger doesn't change it
 }
 

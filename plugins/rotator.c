@@ -1,34 +1,24 @@
-#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include "plugin_common.h"
-#include <stdio.h>
 
-const char* plugin_transform(const char* input) {
+static const char* rotator_transform(const char* in) {
+    if (!in) return NULL;
+    if (strcmp(in, "<END>") == 0) return strdup("<END>");
 
-    if (!input) return NULL;
+    size_t n = strlen(in);
+    if (n == 0) return strdup("");
 
-    printf("[DEBUG][rotator] input: %s\n", input);  
+    char* out = malloc(n + 1);
+    if (!out) return NULL;
 
-    if (strcmp(input, "<END>") == 0)
-    return strdup("<END>");
-
-    char* result = strdup(input);
-    if (!result) return NULL;
-
-    for (int i = 0; result[i]; ++i) {
-        char c = result[i];
-        if ('a' <= c && c <= 'z') {
-            result[i] = ((c - 'a' + 13) % 26) + 'a';
-        } else if ('A' <= c && c <= 'Z') {
-            result[i] = ((c - 'A' + 13) % 26) + 'A';
-        }
-    }
-
-    printf("[PLUGIN][rotator] transformed: %s\n", result);
-    return result;
+    // סיבוב ימינה: התו האחרון לראש, והשאר מוזזים ימינה
+    out[0] = in[n - 1];
+    memcpy(out + 1, in, n - 1);
+    out[n] = '\0';
+    return out;
 }
 
-const char* plugin_init(int queue_size) {
-    return common_plugin_init(plugin_transform, "rotator", queue_size);
+const char* plugin_init(int qsz) {
+    return common_plugin_init(rotator_transform, "rotator", qsz);
 }

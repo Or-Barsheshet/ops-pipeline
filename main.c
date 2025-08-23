@@ -1,9 +1,11 @@
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dlfcn.h>
 #include <pthread.h>
-
+#include <unistd.h>
 #include "plugins/plugin_sdk.h"
 
 // Define function pointer types for clarity
@@ -39,6 +41,7 @@ typedef struct {
     plugin_place_work_func_t place_work;
     plugin_attach_func_t attach;
     plugin_wait_finished_func_t wait_finished;
+    char temp_path[256];
 } plugin_handle_t;
 
 // Struct to pass arguments to the input reader thread
@@ -88,6 +91,28 @@ void* input_reader_thread(void* arg) {
     free(args);
     return NULL;
 }
+static int count_previous(const char* name, char** names, int upto) {
+    int c = 0;
+    for (int k = 0; k < upto; ++k)
+        if (strcmp(names[k], name) == 0) c++;
+    return c;
+}
+
+static int copy_file(const char* src, const char* dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[1<<16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); return -1; }
+    }
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
 
 int main(int argc, char* argv[]) {
     // 1. Argument Parsing
@@ -112,18 +137,43 @@ int main(int argc, char* argv[]) {
     }
 
     // 2. Load Plugin Shared Objects
-    for (int i = 0; i < num_plugins; i++) {
-        char plugin_path[256];
-        snprintf(plugin_path, sizeof(plugin_path), "./output/%s.so", plugin_names[i]);
-        plugins[i].handle = dlopen(plugin_path, RTLD_NOW| RTLD_LOCAL);
-        if (!plugins[i].handle) {
-            fprintf(stderr, "Error loading plugin %s: %s\n", plugin_names[i], dlerror());
+   // 2. Load Plugin Shared Objects
+for (int i = 0; i < num_plugins; i++) {
+    char plugin_path[256];
+    snprintf(plugin_path, sizeof(plugin_path), "./output/%s.so", plugin_names[i]);
+
+    // בדיקה: האם זה מופע שני/שלישי של אותו פלאגין?
+    int inst = count_previous(plugin_names[i], plugin_names, i);
+    const char* path_to_load = plugin_path;
+    plugins[i].temp_path[0] = '\0';
+
+    if (inst > 0) {
+        // יוצרים עותק ייחודי כדי לקבל BSS/סטטיקים נפרדים לכל מופע
+        snprintf(plugins[i].temp_path, sizeof(plugins[i].temp_path),
+                 "./output/%s__inst%d.so", plugin_names[i], inst);
+        if (copy_file(plugin_path, plugins[i].temp_path) != 0) {
+            fprintf(stderr, "Error: failed to create copy for %s (instance %d)\n",
+                    plugin_names[i], inst);
             print_usage();
-            for (int j = 0; j < i; j++) if(plugins[j].handle) dlclose(plugins[j].handle);
+            for (int j = 0; j < i; ++j) if (plugins[j].handle) dlclose(plugins[j].handle);
             free(plugins);
             return 1;
         }
-        
+        path_to_load = plugins[i].temp_path;
+    }
+
+    // נשארים עם dlopen בלבד, כדרישת המטלה
+    plugins[i].handle = dlopen(path_to_load, RTLD_NOW | RTLD_LOCAL);
+    if (!plugins[i].handle) {
+        fprintf(stderr, "Error loading plugin %s: %s\n", plugin_names[i], dlerror());
+        print_usage();
+        for (int j = 0; j < i; j++) if (plugins[j].handle) dlclose(plugins[j].handle);
+        // ניקוי קבצים זמניים שנוצרו עד כה
+        for (int j = 0; j < i; ++j) if (plugins[j].temp_path[0]) unlink(plugins[j].temp_path);
+        free(plugins);
+        return 1;
+    }
+
     LOAD_SYM(plugins, i, get_name,      "plugin_get_name");
     LOAD_SYM(plugins, i, init,          "plugin_init");
     LOAD_SYM(plugins, i, fini,          "plugin_fini");
@@ -131,10 +181,11 @@ int main(int argc, char* argv[]) {
     LOAD_SYM(plugins, i, attach,        "plugin_attach");
     LOAD_SYM(plugins, i, wait_finished, "plugin_wait_finished");
 
-    plugins[i].name = plugins[i].get_name();
-
+    // שם ללוגים לפני init (plugin_get_name יחזיר ערך רק אחרי init אצלך)
+    plugins[i].name = plugin_names[i];
         
     }
+
     // 3. Initialize Plugins
     for (int i = 0; i < num_plugins; i++) {
         const char* err = plugins[i].init(queue_size);
@@ -186,6 +237,9 @@ int main(int argc, char* argv[]) {
     for (int i = num_plugins - 1; i >= 0; i--) {
         plugins[i].fini();
         dlclose(plugins[i].handle);
+        if (plugins[i].temp_path[0]) {
+            unlink(plugins[i].temp_path);  // מחיקת העותק הזמני
+        }   
     }
     
     free(plugins);
