@@ -101,13 +101,13 @@ static void* input_reader_thread(void* arg) {
 int main(int argc, char* argv[]) {
     // ---- 1) Parse args ----
     if (argc < 3) {
-        fprintf(stderr, "Error: Not enough arguments.\n");
+        fprintf(stderr, "[ERROR] Not enough arguments.\n");
         print_usage();
         return 1;
     }
     int queue_size = atoi(argv[1]);
     if (queue_size <= 0) {
-        fprintf(stderr, "Error: Queue size must be a positive integer.\n");
+        fprintf(stderr, "[ERROR] Queue size must be a positive integer.\n");
         print_usage();
         return 1;
     }
@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
 
     const char* dup_name = NULL;
     if (has_duplicate_names(plugin_names, num_plugins, &dup_name)) {
-        fprintf(stderr, "Error: Multiple instances of plugin '%s' are not supported in this implementation.\n", dup_name);
+        fprintf(stderr, "[ERROR] Multiple instances of plugin '%s' are not supported in this implementation.\n", dup_name);
         fprintf(stderr, "Hint: The assignment allows single instance per plugin; multi-instance is a bonus.\n");
         return 1;
     }
@@ -134,7 +134,7 @@ int main(int argc, char* argv[]) {
 
         plugins[i].handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
         if (!plugins[i].handle) {
-            fprintf(stderr, "Error loading plugin '%s' from %s: %s\n",
+            fprintf(stderr, "[ERROR] loading plugin '%s' from %s: %s\n",
                     plugin_names[i], so_path, dlerror());
             print_usage();
             // cleanup previous

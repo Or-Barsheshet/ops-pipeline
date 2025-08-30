@@ -7,7 +7,7 @@ const char* plugin_transform(const char* input) {
 
     if (!input) return NULL;
 
-    printf("[DEBUG][flipper] input: %s\n", input);  
+    // printf("[DEBUG][flipper] input: %s\n", input);  
 
     if (strcmp(input, "<END>") == 0)
     return strdup("<END>");
@@ -22,7 +22,7 @@ const char* plugin_transform(const char* input) {
     }
     result[len] = '\0';
 
-    printf("[PLUGIN][flipper] transformed: %s\n", result);
+    // printf("[PLUGIN][flipper] transformed: %s\n", result);
     return result;
 }
 
