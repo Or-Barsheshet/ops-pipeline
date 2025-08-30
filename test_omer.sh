@@ -301,7 +301,7 @@ else
 fi
 
 # send invalid plugin name to analyzer
-EXPECTED="[ERROR] loading plugin 'strangerdanger' from ./output/strangerdanger.so: ./output/strangerdanger.so: cannot open shared object file: No such file or directory"
+EXPECTED="[ERROR] dlopen failed for 'output/strangerdanger.so': output/strangerdanger.so: cannot open shared object file: No such file or directory"
 ACTUAL=$(./output/analyzer 10 uppercaser logger strangerdanger </dev/null 2>&1 | strip_ansi)
 if [[ "$ACTUAL" == *"$EXPECTED"* ]]; then
     echo -e "Test invalid plugin name: $PASS"

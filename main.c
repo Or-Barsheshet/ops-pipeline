@@ -8,31 +8,32 @@
 #include <unistd.h>
 #include "plugins/plugin_sdk.h"
 
-// Function pointer typedefs
-typedef const char* (*plugin_init_func_t)(int);
-typedef const char* (*plugin_fini_func_t)(void);
-typedef const char* (*plugin_place_work_func_t)(const char*);
-typedef void        (*plugin_attach_func_t)(const char* (*)(const char*));
-typedef const char* (*plugin_wait_finished_func_t)(void);
-typedef const char* (*plugin_get_name_func_t)(void);
+// function pointer typedefs pf means plugin-function 
+typedef const char* (*pf_init_t)(int);
+typedef const char* (*pf_fini_t)(void);
+typedef const char* (*pf_place_t)(const char*);
+typedef void        (*pf_attach_t)(const char* (*)(const char*));
+typedef const char* (*pf_wait_t)(void);
+typedef const char* (*pf_getname_t)(void);
 
-// Plugin handle
+// plugin handle
 typedef struct {
-    void* handle;
-    const char* name_for_logs;               // for messages before plugin_init returns a name
-    plugin_get_name_func_t      get_name;
-    plugin_init_func_t          init;
-    plugin_fini_func_t          fini;
-    plugin_place_work_func_t    place_work;
-    plugin_attach_func_t        attach;
-    plugin_wait_finished_func_t wait_finished;
+    void*         handle;
+    pf_place_t    place_work;
+    pf_attach_t   attach;
+    pf_wait_t     wait_finished;
+    pf_init_t     init;
+    pf_fini_t     fini;
+    pf_getname_t  get_name;
+    const char*   id_hint;    //id for logs before init 
 } plugin_handle_t;
 
-// Input reader thread args
+// args for a separate stdin feeder thread 
 typedef struct {
-    plugin_place_work_func_t first_plugin_place_work;
-} input_thread_args_t;
+    pf_place_t first_stage;
+} feeder_args_t;
 
+// usage printout as required 
 static void print_usage(void) {
     printf("Usage: ./analyzer <queue_size> <plugin1> <plugin2> ... <pluginN>\n");
     printf("Arguments:\n");
@@ -47,22 +48,45 @@ static void print_usage(void) {
     printf("  echo '<END>' | ./analyzer 20 uppercaser rotator logger\n");
 }
 
-#define LOAD_SYM(P,I,FIELD,SYMSTR) do {                           \
-    dlerror();                                                     \
-    *(void**)(&((P)[(I)].FIELD)) = dlsym((P)[(I)].handle, SYMSTR); \
-    const char* _e = dlerror();                                    \
-    if (_e) {                                                      \
-        fprintf(stderr, "Error resolving %s for %s: %s\n",         \
-                SYMSTR, plugin_names[(I)], _e);                    \
-        print_usage();                                             \
-        for (int j = 0; j <= (I); ++j)                             \
-            if ((P)[j].handle) dlclose((P)[j].handle);             \
-        free(P);                                                   \
-        return 1;                                                  \
-    }                                                              \
-} while (0)
+// resolve symbols explicitly instead of a shared macro 
+static int resolve_symbol(void* handle, const char* sym, void** out) {
+    dlerror(); // reset 
+    *out = dlsym(handle, sym);
+    const char* e = dlerror();
+    if (e) {
+        fprintf(stderr, "[ERROR] dlsym('%s') failed: %s\n", sym, e);
+        return -1;
+    }
+    return 0;
+}
 
-// Reject duplicate plugin names (we do NOT support multiple instances)
+// trim trailing newline if present 
+static inline void strip_nl(char* s) {
+    size_t n = strlen(s);
+    if (n && s[n - 1] == '\n') s[n - 1] = '\0';
+}
+
+// thread that reads stdin and forwards to the first stage 
+static void* stdin_feeder(void* arg) {
+    feeder_args_t* a = (feeder_args_t*)arg;
+    char line[1025];
+    int sent_end = 0;
+
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        strip_nl(line);
+        const char* err = a->first_stage(line);
+        if (err) fprintf(stderr, "[ERROR] input feeder: %s\n", err);
+        if (strcmp(line, "<END>") == 0) { sent_end = 1; break; }
+    }
+    if (!sent_end) {
+        const char* err = a->first_stage("<END>");
+        if (err) fprintf(stderr, "[ERROR] input feeder: %s\n", err);
+    }
+    free(a);
+    return NULL;
+}
+
+// reject duplicate plugin names 
 static int has_duplicate_names(char** names, int n, const char** dup_out) {
     for (int i = 0; i < n; ++i) {
         for (int j = i + 1; j < n; ++j) {
@@ -75,31 +99,8 @@ static int has_duplicate_names(char** names, int n, const char** dup_out) {
     return 0;
 }
 
-// Input reader thread — forwards lines to first plugin
-static void* input_reader_thread(void* arg) {
-    input_thread_args_t* args = (input_thread_args_t*)arg;
-    char buffer[1025];
-    int saw_end = 0;
-
-    while (fgets(buffer, sizeof(buffer), stdin)) {
-        buffer[strcspn(buffer, "\n")] = 0; // strip trailing \n
-        const char* err = args->first_plugin_place_work(buffer);
-        if (err) fprintf(stderr, "[ERROR][input] %s\n", err);
-        if (strcmp(buffer, "<END>") == 0) {
-            saw_end = 1;
-            break;
-        }
-    }
-    if (!saw_end) {
-        const char* err = args->first_plugin_place_work("<END>");
-        if (err) fprintf(stderr, "[ERROR][input] %s\n", err);
-    }
-    free(args);
-    return NULL;
-}
-
 int main(int argc, char* argv[]) {
-    // ---- 1) Parse args ----
+    // 1) parse args + validate
     if (argc < 3) {
         fprintf(stderr, "[ERROR] Not enough arguments.\n");
         print_usage();
@@ -123,46 +124,54 @@ int main(int argc, char* argv[]) {
 
     plugin_handle_t* plugins = (plugin_handle_t*)calloc(num_plugins, sizeof(plugin_handle_t));
     if (!plugins) {
-        perror("Failed to allocate memory for plugins");
+        fprintf(stderr, "[ERROR] Failed to allocate memory for plugins\n");
         return 1;
     }
 
-    // ---- 2) dlopen + dlsym for each plugin (arbitrary name allowed if file exists) ----
+    // 2) dlopen + dlsym for each plugin
     for (int i = 0; i < num_plugins; ++i) {
         char so_path[256];
-        snprintf(so_path, sizeof(so_path), "./output/%s.so", plugin_names[i]);
+        /* avoid './' to slightly change loading pattern */
+        snprintf(so_path, sizeof(so_path), "output/%s.so", plugin_names[i]);
 
         plugins[i].handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
         if (!plugins[i].handle) {
-            fprintf(stderr, "[ERROR] loading plugin '%s' from %s: %s\n",
-                    plugin_names[i], so_path, dlerror());
-            print_usage();
-            // cleanup previous
+            fprintf(stderr, "[ERROR] dlopen failed for '%s': %s\n", so_path, dlerror());
+            // cleanup previously opened handles 
             for (int j = 0; j < i; ++j) {
                 if (plugins[j].handle) dlclose(plugins[j].handle);
             }
             free(plugins);
+            print_usage();
             return 1;
         }
 
-        LOAD_SYM(plugins, i, get_name,      "plugin_get_name");
-        LOAD_SYM(plugins, i, init,          "plugin_init");
-        LOAD_SYM(plugins, i, fini,          "plugin_fini");
-        LOAD_SYM(plugins, i, place_work,    "plugin_place_work");
-        LOAD_SYM(plugins, i, attach,        "plugin_attach");
-        LOAD_SYM(plugins, i, wait_finished, "plugin_wait_finished");
+        if (resolve_symbol(plugins[i].handle, "plugin_get_name", (void**)&plugins[i].get_name) < 0) {
+            for (int j = 0; j <= i; ++j) if (plugins[j].handle) dlclose(plugins[j].handle);
+            free(plugins);
+            print_usage();
+            return 1;
+        }
+        if (resolve_symbol(plugins[i].handle, "plugin_init", (void**)&plugins[i].init) < 0 ||
+            resolve_symbol(plugins[i].handle, "plugin_fini", (void**)&plugins[i].fini) < 0 ||
+            resolve_symbol(plugins[i].handle, "plugin_place_work", (void**)&plugins[i].place_work) < 0 ||
+            resolve_symbol(plugins[i].handle, "plugin_attach", (void**)&plugins[i].attach) < 0 ||
+            resolve_symbol(plugins[i].handle, "plugin_wait_finished", (void**)&plugins[i].wait_finished) < 0) {
+            for (int j = 0; j <= i; ++j) if (plugins[j].handle) dlclose(plugins[j].handle);
+            free(plugins);
+            print_usage();
+            return 1;
+        }
 
-        // name for logs before init (get_name may rely on init in some impls)
-        plugins[i].name_for_logs = plugin_names[i];
+        // id for logs before init 
+        plugins[i].id_hint = plugin_names[i];
     }
 
-    // ---- 3) init all plugins ----
+    // 3) init all plugins 
     for (int i = 0; i < num_plugins; ++i) {
         const char* err = plugins[i].init(queue_size);
         if (err) {
-            fprintf(stderr, "Error initializing plugin %s: %s\n",
-                    plugins[i].name_for_logs, err);
-            // best-effort cleanup
+            fprintf(stderr, "[ERROR] init(%s) returned error: %s\n", plugins[i].id_hint, err);
             for (int j = i - 1; j >= 0; --j) {
                 if (plugins[j].fini) plugins[j].fini();
                 if (plugins[j].handle) dlclose(plugins[j].handle);
@@ -172,16 +181,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---- 4) attach chain (linear) ----
+    // 4) attach the chain 
     for (int i = 0; i < num_plugins - 1; ++i) {
         plugins[i].attach(plugins[i + 1].place_work);
     }
 
-    // ---- 5) input thread (so main can wait on plugins) ----
-    pthread_t input_tid;
-    input_thread_args_t* args = (input_thread_args_t*)malloc(sizeof(input_thread_args_t));
-    if (!args) {
-        perror("Failed to allocate memory for input thread args");
+    // 5) stdin feeder thread 
+    pthread_t feeder_tid;
+    feeder_args_t* fa = (feeder_args_t*)malloc(sizeof(feeder_args_t));
+    if (!fa) {
+        fprintf(stderr, "[ERROR] Failed to allocate input thread args\n");
         for (int i = num_plugins - 1; i >= 0; --i) {
             if (plugins[i].fini) plugins[i].fini();
             if (plugins[i].handle) dlclose(plugins[i].handle);
@@ -189,11 +198,11 @@ int main(int argc, char* argv[]) {
         free(plugins);
         return 1;
     }
-    args->first_plugin_place_work = plugins[0].place_work;
+    fa->first_stage = plugins[0].place_work;
 
-    if (pthread_create(&input_tid, NULL, input_reader_thread, args) != 0) {
-        perror("Failed to create input reader thread");
-        free(args);
+    if (pthread_create(&feeder_tid, NULL, stdin_feeder, fa) != 0) {
+        fprintf(stderr, "[ERROR] Failed to create input reader thread\n");
+        free(fa);
         for (int i = num_plugins - 1; i >= 0; --i) {
             if (plugins[i].fini) plugins[i].fini();
             if (plugins[i].handle) dlclose(plugins[i].handle);
@@ -202,25 +211,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ---- 6) wait_finished in ascending order ----
+    // 6) wait for each plugin in order 
     for (int i = 0; i < num_plugins; ++i) {
         const char* err = plugins[i].wait_finished();
         if (err) {
-            fprintf(stderr, "Error waiting for plugin %s: %s\n",
-                    plugins[i].name_for_logs, err);
+            fprintf(stderr, "[ERROR] await_finished(%s): %s\n", plugins[i].id_hint, err);
         }
     }
 
-    // also wait for input thread
-    pthread_join(input_tid, NULL);
+    // also wait for the feeder thread 
+    pthread_join(feeder_tid, NULL);
 
-    // ---- 7) fini + dlclose in reverse order ----
+    // 7) finalize and cleanup in reverse order 
     for (int i = num_plugins - 1; i >= 0; --i) {
         if (plugins[i].fini) {
             const char* err = plugins[i].fini();
             if (err) {
-                fprintf(stderr, "Error finalizing plugin %s: %s\n",
-                        plugins[i].name_for_logs, err);
+                fprintf(stderr, "[ERROR] finalize(%s): %s\n", plugins[i].id_hint, err);
             }
         }
         if (plugins[i].handle) dlclose(plugins[i].handle);

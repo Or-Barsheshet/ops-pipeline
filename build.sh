@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Colors
+# colors for better readable output 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
@@ -10,21 +10,21 @@ print_error()  { echo -e "${RED}[ERROR]${NC} $1"; }
 
 print_status "Starting build..."
 
-# Output dir
+# output dir
 mkdir -p output
 
-# Flags
+# flags
 CFLAGS="-Wall -Wextra -O2 -fPIC"
 LDFLAGS="-ldl -lpthread"
 SH_LDFLAGS="-shared"
 
-# --- Build main ---
-print_status "Building analyzer (main)"
+# build main analyzer
+print_status "Building main analyzer"
 gcc $CFLAGS -o output/analyzer \
   main.c \
   -ldl -lpthread
 
-# --- Build plugins ---
+# build plugins
 PLUGINS="logger uppercaser expander flipper rotator typewriter"
 
 for plugin in $PLUGINS; do
@@ -37,4 +37,4 @@ for plugin in $PLUGINS; do
     -lpthread -ldl
 done
 
-print_status "Build done!"
+print_status "Build is done!"
