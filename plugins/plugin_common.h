@@ -4,26 +4,25 @@
 #include <pthread.h>
 #include "sync/consumer_producer.h"
 
-/* Plugin context structure */
-typedef struct 
-{
-    const char* name;                                /* Plugin name */
-    consumer_producer_t* queue;                      /* Input queue */
-    pthread_t consumer_thread;                       /* Consumer thread */
-    const char* (*next_place_work)(const char*);     /* Next plugin in chain */
-    const char* (*process_function)(const char*);    /* Plugin transform fn */
-    int initialized;                                 /* Init flag */
-    int finished;                                    /* Finished flag */
+// shared plugin context 
+typedef struct {
+    const char* name;                              /* plugin display name */
+    consumer_producer_t* q;                        /* input queue (heap) */
+    pthread_t worker_tid;                          /* consumer thread id */
+    const char* (*send_next)(const char*);         /* next stage place_work */
+    const char* (*transform)(const char*);         /* plugin transform fn */
+    int is_init;                                   /* init state flag */
+    int is_done;                                   /* finished flag */
 } plugin_context_t;
 
-/* Consumer thread entry */
+// worker entry 
 void* plugin_consumer_thread(void* arg);
 
-/* Logging helpers */
-void log_error(plugin_context_t* context, const char* message);
-void log_info(plugin_context_t* context, const char* message);
+// logging helpers 
+void log_error(plugin_context_t* ctx, const char* msg);
+void log_info(plugin_context_t* ctx, const char* msg);
 
-/* Plugin API */
+// plugin api 
 __attribute__((visibility("default")))
 const char* plugin_get_name(void);
 
@@ -46,4 +45,4 @@ void plugin_attach(const char* (*next_place_work)(const char*));
 __attribute__((visibility("default")))
 const char* plugin_wait_finished(void);
 
-#endif /* PLUGIN_COMMON_H */
+#endif 

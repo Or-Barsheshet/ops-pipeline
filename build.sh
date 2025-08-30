@@ -1,40 +1,37 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# colors for better readable output 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
-print_status() { echo -e "${GREEN}[BUILD]${NC} $1"; }
-print_error()  { echo -e "${RED}[ERROR]${NC} $1"; }
+# coloring for readable output
+grn='\033[0;32m'
+red='\033[0;31m'
+rst='\033[0m'
+log_status()   { echo -e "${grn}[BUILD]${rst} $1"; }
+log_fail() { echo -e "${red}[ERROR]${rst} $1"; }
 
-print_status "Starting build..."
+log_status "begin build"
 
-# output dir
+# output directory
 mkdir -p output
 
 # flags
-CFLAGS="-Wall -Wextra -O2 -fPIC"
-LDFLAGS="-ldl -lpthread"
-SH_LDFLAGS="-shared"
+cflags="-Wall -Wextra -O2 -fPIC"
+shared_link="-shared"
 
-# build main analyzer
-print_status "Building main analyzer"
-gcc $CFLAGS -o output/analyzer \
-  main.c \
-  -ldl -lpthread
+# build analyzer
+log_status "building analyzer"
+gcc -o output/analyzer main.c $cflags -lpthread -ldl
 
 # build plugins
-PLUGINS="logger uppercaser expander flipper rotator typewriter"
+plugins=(logger uppercaser expander flipper rotator typewriter)
 
-for plugin in $PLUGINS; do
-  print_status "Building plugin: $plugin"
-  gcc $CFLAGS -fPIC $SH_LDFLAGS -o output/${plugin}.so \
-    plugins/${plugin}.c \
+for p in "${plugins[@]}"; do
+  log_status "building plugin: $p"
+  gcc -fPIC $shared_link $cflags -o "output/$p.so" \
+    "plugins/$p.c" \
     plugins/plugin_common.c \
     plugins/sync/consumer_producer.c \
     plugins/sync/monitor.c \
     -lpthread -ldl
 done
 
-print_status "Build is done!"
+log_status "build complete"

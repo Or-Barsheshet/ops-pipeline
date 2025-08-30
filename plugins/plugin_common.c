@@ -4,143 +4,144 @@
 #include "plugin_common.h"
 #include "sync/consumer_producer.h"
 
-/* Global plugin context (one per .so) */
-static plugin_context_t context;
+// single context instance per shared object 
+static plugin_context_t g_ctx;
 
-/* Info log */
-void log_info(plugin_context_t* context, const char* message) {
-    if (context && message) {
-        fprintf(stdout, "[INFO][%s] - %s\n", context->name, message);
+// info to stdout (non-fatal) 
+void log_info(plugin_context_t* ctx, const char* msg) {
+    if (ctx && msg) {
+        fprintf(stdout, "[info][%s] %s\n", ctx->name, msg);
         fflush(stdout);
     }
 }
 
-/* Error log */
-void log_error(plugin_context_t* context, const char* message) {
-    if (context && message) {
-        fprintf(stderr, "[ERROR][%s] - %s\n", context->name, message);
+// errors to stderr (fatal/non-fatal) 
+void log_error(plugin_context_t* ctx, const char* msg) {
+    if (ctx && msg) {
+        fprintf(stderr, "[ERROR][%s] %s\n", ctx->name, msg);
         fflush(stderr);
     }
 }
 
-/* Return plugin name */
+// export name for external use 
 const char* plugin_get_name(void) {
-    return context.name;
+    return g_ctx.name;
 }
 
-/* Common initialization */
+// shared init used by plugins to bind their transform fn 
 const char* common_plugin_init(const char* (*process_function)(const char*),
                                const char* name,
                                int queue_size) {
-    if (context.initialized) {
-        return "Plugin already initialized";
+    if (g_ctx.is_init) {
+        return "already initialized";
     }
     if (!process_function || !name || queue_size <= 0) {
-        return "Invalid plugin initialization arguments";
+        return "invalid init args";
     }
 
-    context.queue = malloc(sizeof(consumer_producer_t));
-    if (!context.queue) {
-        return "Failed to allocate queue";
+    g_ctx.q = (consumer_producer_t*)malloc(sizeof(consumer_producer_t));
+    if (!g_ctx.q) {
+        return "queue alloc failed";
     }
 
-    if (consumer_producer_init(context.queue, queue_size) != 0) {
-        return "Failed to initialize consumer-producer queue";
+    if (consumer_producer_init(g_ctx.q, queue_size) != 0) {
+        return "queue init failed";
     }
 
-    context.process_function = process_function;
-    context.name = name;
-    context.next_place_work = NULL;
-    context.initialized = 1;
-    context.finished = 0;
+    g_ctx.transform = process_function;
+    g_ctx.name = name;
+    g_ctx.send_next = NULL;
+    g_ctx.is_init = 1;
+    g_ctx.is_done = 0;
 
-    if (pthread_create(&context.consumer_thread,
-                       NULL,
-                       plugin_consumer_thread,
-                       &context) != 0) {
-        return "Failed to create consumer thread";
+    if (pthread_create(&g_ctx.worker_tid, NULL, plugin_consumer_thread, &g_ctx) != 0) {
+        return "consumer thread create failed";
     }
 
     return NULL; /* success */
 }
 
-/* Place work into queue */
+// enqueue input for this plugin 
 const char* plugin_place_work(const char* str) {
-    if (!context.initialized) return "Plugin not initialized";
-    if (!str) return "Invalid input string";
+    if (!g_ctx.is_init) return "plugin not initialized";
+    if (!str) return "null input";
 
-    if (consumer_producer_put(context.queue, str) != 0) {
-        return "Failed to enqueue item";
+    if (consumer_producer_put(g_ctx.q, str) != 0) {
+        return "enqueue failed";
     }
     return NULL;
 }
 
-/* Attach next plugin */
+// set the next stage callback 
 void plugin_attach(const char* (*next_place_work)(const char*)) {
-    if (!context.initialized) {
-        log_error(&context, "Attempted to attach before initialization");
+    if (!g_ctx.is_init) {
+        log_error(&g_ctx, "attach before init");
         return;
     }
-    context.next_place_work = next_place_work;
+    g_ctx.send_next = next_place_work;
 }
 
-/* Wait until finished */
+// wait until this plugin finishes draining 
 const char* plugin_wait_finished(void) {
-    if (!context.initialized) return "Plugin not initialized";
+    if (!g_ctx.is_init) return "plugin not initialized";
 
-    if (consumer_producer_wait_finished(context.queue) != 0) {
-        return "Failed while waiting for queue to finish";
+    if (consumer_producer_wait_finished(g_ctx.q) != 0) {
+        return "wait finished failed";
     }
-    if (pthread_join(context.consumer_thread, NULL) != 0) {
-        return "Failed to join consumer thread";
+    if (pthread_join(g_ctx.worker_tid, NULL) != 0) {
+        return "join failed";
     }
     return NULL;
 }
 
-/* Finalize plugin */
+// finalize and release resources 
 const char* plugin_fini(void) {
-    if (!context.initialized) return "Plugin not initialized";
+    if (!g_ctx.is_init) return "plugin not initialized";
 
-    consumer_producer_destroy(context.queue);
-    free(context.queue);
-    context.queue = NULL;
+    consumer_producer_destroy(g_ctx.q);
+    free(g_ctx.q);
+    g_ctx.q = NULL;
 
-    context.initialized = 0;
-    context.finished = 0;
-    context.name = NULL;
-    context.process_function = NULL;
-    context.next_place_work = NULL;
+    g_ctx.is_init = 0;
+    g_ctx.is_done = 0;
+    g_ctx.name = NULL;
+    g_ctx.transform = NULL;
+    g_ctx.send_next = NULL;
 
     return NULL;
 }
 
-/* Worker thread for each plugin */
+// internal helper: check end sentinel 
+static inline int is_end(const char* s) {
+    return s && strcmp(s, "<END>") == 0;
+}
+
+// worker thread: consumes, transforms, forwards 
 void* plugin_consumer_thread(void* arg) {
     plugin_context_t* ctx = (plugin_context_t*)arg;
 
-    while (1) {
-        char* input = consumer_producer_get(ctx->queue);
-        if (!input) continue;
+    for (;;) {
+        char* in = consumer_producer_get(ctx->q);
+        if (!in) continue;
 
-        if (strcmp(input, "<END>") == 0) {
-            free(input);
+        if (is_end(in)) {
+            free(in);
             break;
         }
 
-        const char* output = ctx->process_function(input);
-
-        if (ctx->next_place_work) {
-            ctx->next_place_work(output);
+        const char* out = ctx->transform(in);
+        if (ctx->send_next) {
+            (void)ctx->send_next(out);
         } else {
-            free((void*)output);
+            free((void*)out);
         }
-        free(input);
+        free(in);
     }
 
-    if (ctx->next_place_work) {
-        ctx->next_place_work("<END>");
+    if (ctx->send_next) {
+        (void)ctx->send_next("<END>");
     }
-    consumer_producer_signal_finished(ctx->queue);
-    ctx->finished = 1;
+    consumer_producer_signal_finished(ctx->q);
+    ctx->is_done = 1;
     return NULL;
 }

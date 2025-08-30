@@ -3,16 +3,17 @@
 #include <stdlib.h>
 #include "plugin_common.h"
 
-const char* logger_transform(const char* input) {
-    if (!input) return NULL;
+// print and forward the line unchanged
+const char* logger_transform(const char* input_str) {
+    if (!input_str) return NULL;
 
-    if (strcmp(input, "<END>") == 0) {
+    if (strcmp(input_str, "<END>") == 0) {
         return strdup("<END>"); 
     }
     
-    printf("[logger] %s\n", input);
+    printf("[logger] %s\n", input_str);
     fflush(stdout);
-    return strdup(input);  // return a duplicate even if logger doesn't change it
+    return strdup(input_str);  
 }
 
 const char* plugin_init(int queue_size) {
